@@ -1,5 +1,6 @@
 import type { StaticCanvas } from "fabric/node";
-import type { DebugOptions } from "../configuration.js";
+import type { DebugOptions, ResolvedHdrOptions } from "../configuration.js";
+import type { DecodeCachePlan } from "../decodeCache.js";
 import type { BaseLayer, OptionalPromise } from "../types.js";
 
 /**
@@ -24,6 +25,8 @@ export type CreateFrameSourceOptions<T> = DebugOptions & {
   channels: number;
   framerateStr: string;
   params: T;
+  hdr?: ResolvedHdrOptions;
+  decodeCache?: DecodeCachePlan;
 };
 
 export interface FrameSourceFactory<T extends BaseLayer> {

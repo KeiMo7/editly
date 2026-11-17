@@ -115,3 +115,4 @@ editly-tmp-*/
 pnpm-lock.yaml
 yarn.lock
 package-lock.json
+test/.tmp-hdr/

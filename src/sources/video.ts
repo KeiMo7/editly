@@ -1,6 +1,17 @@
 import { ExecaError } from "execa";
 import * as fabric from "fabric/node";
+import fsExtra from "fs-extra";
+import type { FileHandle } from "fs/promises";
+import { open } from "fs/promises";
+import { nanoid } from "nanoid";
 import { defineFrameSource } from "../api/index.js";
+import { resolveColorHandling } from "../color.js";
+import {
+  getDecodeCacheKey,
+  getDecodeCachePaths,
+  noteCacheHit,
+  noteFfmpegDecode,
+} from "../decodeCache.js";
 import { ffmpeg, readFileStreams } from "../ffmpeg.js";
 import { rawVideoToFrames } from "../transforms/rawVideoToFrames.js";
 import type { VideoLayer } from "../types.js";
@@ -14,6 +25,8 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
     framerateStr,
     verbose,
     logTimes,
+    hdr,
+    decodeCache,
     params,
   } = options;
 
@@ -98,6 +111,11 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
   if (firstVideoStream?.codec_name === "vp8") inputCodec = "libvpx";
   else if (firstVideoStream?.codec_name === "vp9") inputCodec = "libvpx-vp9";
 
+  // HDR: resolve how this input must be decoded (probed & classified once per
+  // asset, cached). SDR inputs get no extra filters and behave exactly as before.
+  const colorHandling = hdr?.enabled ? await resolveColorHandling(path, hdr) : undefined;
+  const toneMapFilter = colorHandling?.toneMapFilter;
+
   // http://zulko.github.io/blog/2013/09/27/read-and-write-video-frames-in-python-using-ffmpeg/
   // Testing: ffmpeg -i 'vid.mov' -t 1 -vcodec rawvideo -pix_fmt rgba -f image2pipe - | ffmpeg -f rawvideo -vcodec rawvideo -pix_fmt rgba -s 2166x1650 -i - -vf format=yuv420p -vcodec libx264 -y out.mp4
   // https://trac.ffmpeg.org/wiki/ChangingFrameRate
@@ -109,7 +127,7 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
     path,
     ...(cutTo ? ["-t", ((cutTo - cutFrom!) * speedFactor!).toString()] : []),
     "-vf",
-    `${ptsFilter}fps=${framerateStr},${scaleFilter}`,
+    `${ptsFilter}fps=${framerateStr},${scaleFilter}${toneMapFilter ? `,${toneMapFilter}` : ""}`,
     "-map",
     "v:0",
     "-vcodec",
@@ -121,44 +139,192 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
     "-",
   ];
 
+  const frameByteSize = targetWidth * targetHeight * channels;
+
+  // Decode-once cache: if this file is referenced multiple times, the first
+  // decode stores the raw frames in tmpDir and later references stream them
+  // from disk instead of decoding again.
+  const decodeCacheKey =
+    decodeCache && decodeCache.cacheablePaths.has(path)
+      ? getDecodeCacheKey({
+          path,
+          cutFrom,
+          cutTo,
+          speedFactor,
+          framerateStr,
+          targetWidth,
+          targetHeight,
+          toneMapFilter,
+        })
+      : undefined;
+
+  let cacheReadHandle: FileHandle | undefined;
+  let cacheReadOffset = 0;
+  let cacheReadPath: string | undefined;
+  let waitForCacheBytes: ((byteCount: number) => Promise<boolean>) | undefined;
+  let cacheDecodeFailed = false;
+  let closed = false;
+
   const controller = new AbortController();
-  const transform = rawVideoToFrames({
-    width: targetWidth,
-    height: targetHeight,
-    channels,
-    signal: controller.signal,
-  });
-  const ps = ffmpeg(args, {
-    encoding: "buffer",
-    buffer: false,
-    stdin: "ignore",
-    stdout: { transform },
-    stderr: process.stderr,
-    // ffmpeg doesn't like to stop, force it
-    forceKillAfterDelay: 1000,
-    cancelSignal: controller.signal,
-  });
 
-  // Ignore errors if the process is aborted
-  ps.catch((err: ExecaError) => {
-    if (!err.isCanceled) throw err;
-    if (verbose) console.log("ffmpeg process aborted", path);
-  });
+  // Wall-clock decode timing, so the cost of the HDR path vs the SDR path can
+  // be measured (logTimes). The streaming decode is usually aborted at clip
+  // end, so the timing is reported when the source is closed.
+  let decodeStartedAt: number | undefined;
+  const logDecodeTiming = (event: string) => {
+    if (logTimes && decodeStartedAt != null) {
+      console.log(
+        `Decode ${event} for ${path} after ${Date.now() - decodeStartedAt}ms (color: ${colorHandling?.classification.kind ?? "sdr"}${toneMapFilter ? ", tone-mapped" : ""})`,
+      );
+      decodeStartedAt = undefined;
+    }
+  };
 
-  // Convert process to iterator to fetch frame data
-  const iterator = ps.iterable();
+  if (decodeCacheKey && decodeCache) {
+    const { frameFile, doneFile } = getDecodeCachePaths(decodeCache, decodeCacheKey);
+    if (await fsExtra.pathExists(doneFile)) {
+      noteCacheHit();
+      if (verbose) console.log("Decode cache hit, streaming frames from cache:", path);
+      cacheReadHandle = await open(frameFile, "r");
+    } else {
+      // Decode straight to a cache file. ffmpeg writes the file directly, so
+      // the decode is not throttled by frame consumption and finishes as fast
+      // as possible; frames are read back from the growing file. A unique tmp
+      // name + atomic rename keeps this safe when two frame sources decode
+      // the same asset concurrently (e.g. overlapping transition sources).
+      const tmpFile = `${frameFile}.${nanoid()}.tmp`;
+      cacheReadPath = tmpFile;
+      let cacheDecodeDone = false;
+
+      noteFfmpegDecode();
+      decodeStartedAt = Date.now();
+      const cacheArgs = [...args.slice(0, -3), "-f", "rawvideo", "-y", tmpFile];
+      const cachePs = ffmpeg(cacheArgs, {
+        encoding: "buffer",
+        buffer: false,
+        stdin: "ignore",
+        stderr: process.stderr,
+        // ffmpeg doesn't like to stop, force it
+        forceKillAfterDelay: 1000,
+        cancelSignal: controller.signal,
+      });
+
+      cachePs
+        .then(async () => {
+          logDecodeTiming("finished");
+          await fsExtra.move(tmpFile, frameFile, { overwrite: true });
+          cacheReadPath = frameFile;
+          await fsExtra.writeFile(doneFile, "");
+          cacheDecodeDone = true;
+          if (verbose) console.log("Decode cache stored:", path);
+        })
+        .catch((err: ExecaError) => {
+          cacheDecodeDone = true;
+          if (!err.isCanceled) {
+            cacheDecodeFailed = true;
+            console.error(`Failed to decode video: ${path}`);
+          }
+          // Aborted or failed decode: never leave a partial cache file behind
+          fsExtra.remove(tmpFile).catch(() => {});
+        });
+
+      waitForCacheBytes = async (byteCount: number) => {
+        for (;;) {
+          if (closed || cacheDecodeFailed) return false;
+          let size = 0;
+          try {
+            size = (await fsExtra.stat(cacheReadPath!)).size;
+          } catch {
+            // File not created yet
+          }
+          if (size >= byteCount) return true;
+          if (cacheDecodeDone) return false;
+          await new Promise((resolve) => {
+            setTimeout(resolve, 25);
+          });
+        }
+      };
+    }
+  }
+
+  let ps: ReturnType<typeof ffmpeg> | undefined;
+  let iterator: AsyncIterableIterator<unknown> | undefined;
+
+  if (!cacheReadHandle && !waitForCacheBytes) {
+    noteFfmpegDecode();
+    decodeStartedAt = Date.now();
+    const transform = rawVideoToFrames({
+      width: targetWidth,
+      height: targetHeight,
+      channels,
+      signal: controller.signal,
+    });
+    ps = ffmpeg(args, {
+      encoding: "buffer",
+      buffer: false,
+      stdin: "ignore",
+      stdout: { transform },
+      stderr: process.stderr,
+      // ffmpeg doesn't like to stop, force it
+      forceKillAfterDelay: 1000,
+      cancelSignal: controller.signal,
+    });
+
+    const processDone = ps as unknown as Promise<unknown>;
+    processDone
+      .then(async () => {
+        logDecodeTiming("finished");
+      })
+      .catch(() => {});
+
+    // Ignore errors if the process is aborted
+    ps.catch((err: ExecaError) => {
+      if (!err.isCanceled) throw err;
+      if (verbose) console.log("ffmpeg process aborted", path);
+    });
+
+    // Convert process to iterator to fetch frame data
+    iterator = ps.iterable();
+  }
 
   async function readNextFrame(progress: number, canvas: fabric.StaticCanvas, time: number) {
-    const { value: rgba, done } = await iterator.next();
+    let rgba: Uint8Array | undefined;
 
-    if (done) {
-      if (verbose) console.log(path, "ffmpeg video stream ended");
-      return;
-    }
+    if (cacheReadHandle || waitForCacheBytes) {
+      if (waitForCacheBytes) {
+        const ok = await waitForCacheBytes(cacheReadOffset + frameByteSize);
+        if (!ok) {
+          if (cacheDecodeFailed) throw new Error(`Failed to decode video (decode cache): ${path}`);
+          if (verbose) console.log(path, "decode cache stream ended");
+          return;
+        }
+      }
+      if (!cacheReadHandle) {
+        // Open lazily: the cache file is created by the decoder process
+        cacheReadHandle = await open(cacheReadPath!, "r");
+      }
+      const buffer = Buffer.alloc(frameByteSize);
+      const { bytesRead } = await cacheReadHandle.read(buffer, 0, frameByteSize, cacheReadOffset);
+      if (bytesRead < frameByteSize) {
+        if (verbose) console.log(path, "decode cache stream ended");
+        return;
+      }
+      cacheReadOffset += bytesRead;
+      rgba = buffer;
+    } else {
+      const { value, done } = await iterator!.next();
 
-    if (!rgba) {
-      if (verbose) console.log(path, "No frame data received");
-      return;
+      if (done) {
+        if (verbose) console.log(path, "ffmpeg video stream ended");
+        return;
+      }
+
+      if (!value) {
+        if (verbose) console.log(path, "No frame data received");
+        return;
+      }
+
+      rgba = value as Uint8Array;
     }
 
     if (logTimes) console.time("rgbaToFabricImage");
@@ -213,7 +379,10 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
 
   const close = () => {
     if (verbose) console.log("Close", path);
-    if (!ps.exitCode) controller.abort();
+    closed = true;
+    logDecodeTiming("stopped");
+    if (ps && !ps.exitCode) controller.abort();
+    cacheReadHandle?.close().catch(() => {});
   };
 
   return {

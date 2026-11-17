@@ -32,6 +32,7 @@ This GIF / YouTube was created with this command: "editly [commonFeatures.json5]
 - Preserve/mix multiple audio sources
 - Automatic audio crossfading
 - Automatic audio ducking and normalization
+- Automatic HDR (HDR10 / HLG) input detection with configurable tone-mapping to SDR
 
 ## Use cases
 
@@ -410,6 +411,50 @@ See [position.json5](examples/position.json5)
 | --------------- | -------------------------------------------------------------------------------------- | ------- | --- |
 | `zoomDirection` | Zoom direction for Ken Burns effect: `in`, `out`, `left`, `right` or `null` to disable |         |     |
 | `zoomAmount`    | Zoom amount for Ken Burns effect                                                       | `0.1`   |     |
+
+### HDR (HDR10 / HLG) input
+
+Editly automatically detects HDR video inputs and converts them to SDR (BT.709) at decode time, so colors and brightness no longer collapse when mixing HDR footage into an edit. SDR inputs are completely unaffected, and the output of SDR-only edits is bit-for-bit identical to previous versions.
+
+- **HDR10** (BT.2020 primaries + PQ/`smpte2084` transfer): linearized and run through a configurable tone-mapping operator (ffmpeg `zscale` + `tonemap`).
+- **HLG** (`arib-std-b67`): converted with a dedicated transfer/primaries conversion (BT.2408 style via `zscale`), *not* the PQ tone-mapping curve.
+- When any HDR source was tone-mapped, the output is tagged as BT.709 (`color_primaries`/`color_trc`/`colorspace`).
+- The same video file referenced by multiple clips is only decoded once per edit (decoded frames are cached in the edit's temporary directory).
+
+HDR handling can be tuned with the top-level `hdr` option:
+
+| Parameter                     | Description                                                                                                                            | Default      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `hdr.enabled`                 | Auto-detect and correctly process HDR inputs. Set to `false` to force the legacy behavior (decode everything as-is).                   | `true`       |
+| `hdr.mode`                    | `toneMap`: convert HDR to SDR at decode time. `passthrough`: reserved for a future 10-bit pipeline - currently fails fast with an explicit error, because the compositor stage is 8-bit RGBA and would silently truncate. | `'toneMap'`  |
+| `hdr.toneMapping.algorithm`   | Tone-map operator for HDR10 sources: `hable`, `mobius`, `reinhard`, `clip`, `linear`, `gamma` (maps to ffmpeg's `tonemap` filter).      | `'hable'`    |
+| `hdr.toneMapping.param`       | `param` passed to the tonemap filter.                                                                                                  | (filter default) |
+| `hdr.toneMapping.desat`       | `desat` passed to the tonemap filter.                                                                                                  | (filter default) |
+| `hdr.toneMapping.peak`        | `peak` (signal peak override) passed to the tonemap filter.                                                                            | (filter default) |
+| `hdr.onMissingMetadata`       | `warn`: files with missing/contradictory HDR metadata are treated as SDR with a warning. `error`: refuse to process them. Never guessed. | `'warn'`     |
+
+Migration example - if the new auto-detection causes trouble with an existing workflow, restore the old behavior explicitly:
+
+```js
+// Before (implicit old behavior): HDR sources were decoded as-is and looked washed out
+await editly({ outPath: 'out.mp4', clips: [/* ... */] });
+
+// After: nothing to change - HDR is handled automatically. To opt out:
+await editly({ outPath: 'out.mp4', clips: [/* ... */], hdr: { enabled: false } });
+
+// To tune the HDR10 tone mapping:
+await editly({
+  outPath: 'out.mp4',
+  clips: [/* ... */],
+  hdr: { toneMapping: { algorithm: 'mobius', param: 0.5, desat: 1.5 } },
+});
+```
+
+Notes:
+
+- **Failure behavior**: unsupported configurations (e.g. `hdr.mode: 'passthrough'`) fail before any output is written, with an error naming the unsupported pipeline stage. If rendering fails mid-way while the HDR pipeline is active, the incomplete output file is removed.
+- **Performance**: the HDR decode path is slower than plain SDR decode (extra `zscale`/`tonemap` filters). Run with `logTimes: true` to get per-file decode timings annotated with the detected color type, e.g. `Decode finished for clip.mp4 after 345ms (color: hdr10, tone-mapped)`.
+- **Concurrency**: frame sources are created sequentially, but two sources may decode the same file concurrently during transitions. The decode cache uses unique temporary files and atomic renames, so concurrent decodes are safe (worst case: the file is decoded twice, never corrupted).
 
 ## Docker
 

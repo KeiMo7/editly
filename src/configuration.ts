@@ -16,6 +16,83 @@ export type FfmpegConfig = {
   enableFfmpegLog?: boolean;
 };
 
+export const toneMappingAlgorithms = [
+  "hable",
+  "mobius",
+  "reinhard",
+  "clip",
+  "linear",
+  "gamma",
+] as const;
+
+export type ToneMappingAlgorithm = (typeof toneMappingAlgorithms)[number];
+
+export type HdrToneMappingOptions = {
+  /**
+   * Tonemap operator used for HDR10 (PQ) sources (maps to ffmpeg's `tonemap` filter).
+   *
+   * @default 'hable'
+   */
+  algorithm?: ToneMappingAlgorithm;
+
+  /**
+   * Algorithm parameter passed to the tonemap filter (`param`).
+   */
+  param?: number;
+
+  /**
+   * Desaturation strength passed to the tonemap filter (`desat`).
+   */
+  desat?: number;
+
+  /**
+   * Signal peak override passed to the tonemap filter (`peak`).
+   */
+  peak?: number;
+};
+
+export type HdrOptions = {
+  /**
+   * Automatically detect HDR inputs (HDR10/HLG) and convert them correctly.
+   * Set to `false` to force the legacy behavior (decode everything as-is).
+   *
+   * @default true
+   */
+  enabled?: boolean;
+
+  /**
+   * `toneMap`: convert HDR to SDR (BT.709) at decode time (default).
+   * `passthrough`: keep HDR end-to-end. NOTE: the compositor stage is currently
+   * 8-bit RGBA, so `passthrough` fails fast with an explicit error instead of
+   * silently truncating to 8 bit.
+   *
+   * @default 'toneMap'
+   */
+  mode?: "toneMap" | "passthrough";
+
+  /**
+   * Tone-mapping strategy and parameters for HDR10 (PQ) sources.
+   * HLG sources are converted with a dedicated transfer conversion instead.
+   */
+  toneMapping?: HdrToneMappingOptions;
+
+  /**
+   * What to do when HDR-ish metadata is missing or contradictory:
+   * `warn`: treat the file as SDR and log a warning (default).
+   * `error`: refuse to process the file.
+   *
+   * @default 'warn'
+   */
+  onMissingMetadata?: "warn" | "error";
+};
+
+export type ResolvedHdrOptions = {
+  enabled: boolean;
+  mode: "toneMap" | "passthrough";
+  toneMapping: HdrToneMappingOptions & { algorithm: ToneMappingAlgorithm };
+  onMissingMetadata: "warn" | "error";
+};
+
 export type ConfigurationOptions = {
   /**
    * Output path (`.mp4` or `.mkv`, can also be a `.gif`).
@@ -141,6 +218,12 @@ export type ConfigurationOptions = {
    * WARNING: Undocumented feature!
    */
   keepTmp?: boolean;
+
+  /**
+   * HDR (HDR10/HLG) input handling. HDR inputs are auto-detected and
+   * tone-mapped to SDR by default; SDR inputs are unaffected.
+   */
+  hdr?: HdrOptions;
 } & DebugOptions &
   FfmpegConfig;
 
@@ -191,12 +274,28 @@ export class Configuration {
   ffmpegPath: string;
   ffprobePath: string;
 
+  // HDR
+  hdr: ResolvedHdrOptions;
+
   constructor(input: ConfigurationOptions) {
     assert(input.outPath, "Please provide an output path");
     assert(Array.isArray(input.clips) && input.clips.length > 0, "Please provide at least 1 clip");
     assert(
       !input.customOutputArgs || Array.isArray(input.customOutputArgs),
       "customOutputArgs must be an array of arguments",
+    );
+    assert(
+      !input.hdr?.mode || ["toneMap", "passthrough"].includes(input.hdr.mode),
+      "hdr.mode must be 'toneMap' or 'passthrough'",
+    );
+    assert(
+      !input.hdr?.toneMapping?.algorithm ||
+        toneMappingAlgorithms.includes(input.hdr.toneMapping.algorithm),
+      `hdr.toneMapping.algorithm must be one of ${toneMappingAlgorithms.join(", ")}`,
+    );
+    assert(
+      !input.hdr?.onMissingMetadata || ["warn", "error"].includes(input.hdr.onMissingMetadata),
+      "hdr.onMissingMetadata must be 'warn' or 'error'",
     );
 
     this.outPath = input.outPath;
@@ -252,6 +351,18 @@ export class Configuration {
 
     this.ffmpegPath = input.ffmpegPath ?? "ffmpeg";
     this.ffprobePath = input.ffprobePath ?? "ffprobe";
+
+    this.hdr = {
+      enabled: input.hdr?.enabled ?? true,
+      mode: input.hdr?.mode ?? "toneMap",
+      toneMapping: {
+        algorithm: input.hdr?.toneMapping?.algorithm ?? "hable",
+        param: input.hdr?.toneMapping?.param,
+        desat: input.hdr?.toneMapping?.desat,
+        peak: input.hdr?.toneMapping?.peak,
+      },
+      onMissingMetadata: input.hdr?.onMissingMetadata ?? "warn",
+    };
 
     this.tmpDir = join(this.outDir, `editly-tmp-${nanoid()}`);
   }

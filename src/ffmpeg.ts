@@ -10,6 +10,12 @@ export type Stream = {
   r_frame_rate: string;
   width?: number;
   height?: number;
+  pix_fmt?: string;
+  color_space?: string;
+  color_transfer?: string;
+  color_primaries?: string;
+  color_range?: string;
+  bits_per_raw_sample?: string;
   tags?: {
     rotate: string;
   };
@@ -108,9 +114,29 @@ export async function readDuration(p: string) {
   return parsed;
 }
 
-export async function readFileStreams(p: string) {
+// Probe results are cached per path so that a file referenced by multiple
+// clips/layers is only probed once per edit run.
+const readFileStreamsCache = new Map<string, Promise<Stream[]>>();
+
+async function readFileStreamsUncached(p: string) {
   const { stdout } = await ffprobe(["-show_entries", "stream", "-of", "json", p]);
   return JSON.parse(stdout).streams as Stream[];
+}
+
+export function readFileStreams(p: string) {
+  let cached = readFileStreamsCache.get(p);
+  if (!cached) {
+    cached = readFileStreamsUncached(p);
+    // Don't cache rejections, so a transient failure can be retried
+    cached.catch(() => readFileStreamsCache.delete(p));
+    readFileStreamsCache.set(p, cached);
+  }
+  return cached;
+}
+
+// Mostly for tests
+export function clearReadFileStreamsCache() {
+  readFileStreamsCache.clear();
 }
 
 export async function readVideoFileInfo(p: string) {

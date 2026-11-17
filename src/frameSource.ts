@@ -1,5 +1,6 @@
 import pMap from "p-map";
-import type { DebugOptions } from "./configuration.js";
+import type { DebugOptions, ResolvedHdrOptions } from "./configuration.js";
+import type { DecodeCachePlan } from "./decodeCache.js";
 import type { ProcessedClip } from "./parseConfig.js";
 import { createFabricCanvas, renderFabricCanvas, rgbaToFabricImage } from "./sources/fabric.js";
 import { createLayerSource } from "./sources/index.js";
@@ -11,6 +12,8 @@ type FrameSourceOptions = DebugOptions & {
   height: number;
   channels: number;
   framerateStr: string;
+  hdr?: ResolvedHdrOptions;
+  decodeCache?: DecodeCachePlan;
 };
 
 export async function createFrameSource({
@@ -22,6 +25,8 @@ export async function createFrameSource({
   verbose,
   logTimes,
   framerateStr,
+  hdr,
+  decodeCache,
 }: FrameSourceOptions) {
   const { layers, duration } = clip;
 
@@ -40,6 +45,8 @@ export async function createFrameSource({
         verbose,
         logTimes,
         framerateStr,
+        hdr,
+        decodeCache,
         params: layer,
       };
       return createLayerSource(options);
